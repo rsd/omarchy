@@ -328,6 +328,52 @@ case "$channel" in
     ;;
 esac
 
+# The quattro omarchy package hard-depends on limine, limine-mkinitcpio-hook and
+# limine-snapper-sync, so the boot menu and the snapshot rollback both assume
+# Limine is the bootloader in charge. Nothing here converts a bootloader, so a
+# GRUB or systemd-boot machine would otherwise gain a second, half-configured
+# one without ever being asked. The unprivileged package check comes first, but
+# /boot is often mounted so only root can read it, so the config file has to be
+# probed through as_root; this runs late enough that sudo is already held.
+check_bootloader() {
+  local bootloader
+
+  package_installed_exact limine && return 0
+  as_root test -f /boot/limine.conf && return 0
+
+  if package_installed_exact grub || as_root test -f /boot/grub/grub.cfg; then
+    bootloader="GRUB"
+  elif command -v bootctl >/dev/null 2>&1 && as_root bootctl --quiet is-installed >/dev/null 2>&1; then
+    bootloader="systemd-boot"
+  else
+    bootloader="an unrecognized bootloader"
+  fi
+
+  warn "This machine boots via $bootloader, not Limine."
+  cat >&2 <<EOF
+
+Omarchy quattro installs and assumes the Limine bootloader: the boot menu and
+the snapshot rollback driven by limine-snapper-sync are both built on it.
+
+This upgrade does not convert the bootloader, so the machine keeps booting
+$bootloader.
+
+Limine's mkinitcpio and entry hooks are still installed alongside it and may
+begin writing to the ESP on kernel transactions, and Quattro's snapshot-restore
+experience will not work until the machine is converted to Limine by hand after
+the upgrade.
+
+EOF
+
+  # An unattended run cannot make this call, and quietly leaving the machine
+  # with two bootloaders in play is the wrong thing to assume on its behalf.
+  if (( yes )); then
+    fail "Re-run interactively to acknowledge that this machine does not boot via Limine."
+  fi
+
+  gum confirm "Continue with upgrade anyway?" </dev/tty || exit 0
+}
+
 if (( ! yes )); then
   printf '\033[2J\033[3J\033[H' >/dev/tty
   cat <<EOF
@@ -2384,6 +2430,10 @@ refresh_current_theme_after_upgrade() {
   # emulators so the active upgrade terminal picks up generated theme files.
   run_as_user_omarchy omarchy-restart-terminal >/dev/null 2>&1 || true
 }
+
+# Last read-only preflight, so a machine that does not boot via Limine can still
+# back out with nothing changed.
+check_bootloader
 
 # Everything below mutates the system, so a non-zero exit from here on leaves a
 # half-upgraded machine that must not be rebooted.
