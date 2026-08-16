@@ -386,6 +386,116 @@ fi
 
 backup_suffix=$(date +%Y%m%d%H%M%S)
 
+iwd_in_use() {
+  systemctl is-enabled --quiet iwd.service 2>/dev/null ||
+    systemctl is-active --quiet iwd.service 2>/dev/null
+}
+
+interface_is_wireless() {
+  [[ -e $1/wireless || -e $1/phy80211 ]]
+}
+
+# Legacy Omarchy enables iwd on every install, wireless hardware or not, so the
+# presence of the service says nothing on its own.
+wireless_interface_exists() {
+  local interface
+  for interface in /sys/class/net/*; do
+    interface_is_wireless "$interface" && return 0
+  done
+
+  return 1
+}
+
+iwd_has_saved_networks() {
+  local count
+  # /var/lib/iwd is root-only: .psk holds personal networks, .8021x enterprise
+  # ones. A directory that cannot be read answers nothing, so only a definite
+  # zero clears the machine.
+  count=$(as_root bash -c '
+    shopt -s nullglob
+    networks=(/var/lib/iwd/*.psk /var/lib/iwd/*.8021x)
+    printf "%s\n" "${#networks[@]}"
+  ' 2>/dev/null || true)
+
+  [[ $count != "0" ]]
+}
+
+networkmanager_wifi_profile_exists() {
+  # /etc/NetworkManager/system-connections is root-only, so look as root. Newer
+  # keyfiles say type=wifi, ones written by older NetworkManager say
+  # type=802-11-wireless; both still count as a profile that survives the swap.
+  as_root bash -c '
+    shopt -s nullglob
+    for profile in /etc/NetworkManager/system-connections/*; do
+      grep -qE "^type=(wifi|802-11-wireless)$" "$profile" && exit 0
+    done
+    exit 1
+  ' >/dev/null 2>&1
+}
+
+wired_link_connected() {
+  local carrier_path interface
+  for carrier_path in /sys/class/net/*/carrier; do
+    interface=${carrier_path%/carrier}
+    # Loopback and virtual links have no device symlink; skip Wi-Fi too, since
+    # the whole question is whether something other than Wi-Fi is carrying.
+    [[ -e $interface/device ]] || continue
+    interface_is_wireless "$interface" && continue
+    [[ $(cat "$carrier_path" 2>/dev/null || true) == "1" ]] && return 0
+  done
+
+  return 1
+}
+
+# Quattro standardizes on NetworkManager: the upgrade disables iwd, removes it,
+# and never migrates the credentials iwd keeps in /var/lib/iwd. A machine that
+# reaches the network over iwd-managed Wi-Fi therefore reboots into a system
+# with no known networks, and possibly no way to pacman its way out. Warn while
+# there is still a network to fix it with, but only where the swap can actually
+# bite: wireless hardware, Wi-Fi networks iwd knows and NetworkManager does not.
+check_network_transition() {
+  wireless_interface_exists || return 0
+  iwd_in_use || return 0
+  iwd_has_saved_networks || return 0
+  networkmanager_wifi_profile_exists && return 0
+
+  local wired=0
+  wired_link_connected && wired=1
+
+  warn "iwd has saved Wi-Fi networks on this machine and NetworkManager has no Wi-Fi profile of its own."
+  if (( wired )); then
+    printf 'A wired link is up right now, so the machine should still come back online after the reboot - but only for as long as that cable stays plugged in.\n' >&2
+  else
+    printf 'No wired link is up either, so Wi-Fi looks like the only way this machine reaches the network.\n' >&2
+  fi
+  cat >&2 <<'EOF'
+The upgrade removes iwd and switches to NetworkManager, and the Wi-Fi credentials
+iwd stores in /var/lib/iwd are NOT migrated. After the reboot NetworkManager can
+come up with no known networks at all.
+
+Do one of these first:
+  1. Move this machine to NetworkManager now and confirm it works:
+       sudo systemctl disable --now iwd
+       sudo systemctl enable --now NetworkManager
+       nmcli device wifi connect "<SSID>" --ask
+  2. Note the passphrase (iwd may still have it in cleartext:
+     sudo grep -h Passphrase /var/lib/iwd/*.psk) and run
+     'nmcli device wifi connect "<SSID>" --ask' after the reboot.
+  3. Plug in Ethernet and leave it plugged in through the reboot.
+
+EOF
+
+  if (( yes )); then
+    # Only the machine that is riding on Wi-Fi right now is worth stopping; one
+    # with a live cable can be fixed after the reboot.
+    (( wired )) || fail "Refusing to strand a Wi-Fi-only machine. Create a NetworkManager Wi-Fi profile first, or re-run without --yes to override."
+    warn "Continuing because --yes was passed and a wired link is up. Sort the Wi-Fi profile out before that cable goes away."
+    return 0
+  fi
+
+  gum confirm "Continue with upgrade anyway?" </dev/tty || exit 0
+}
+
 configure_pacman_channel() {
   log "Configuring Omarchy pacman repositories ($channel)"
 
@@ -2384,6 +2494,10 @@ refresh_current_theme_after_upgrade() {
   # emulators so the active upgrade terminal picks up generated theme files.
   run_as_user_omarchy omarchy-restart-terminal >/dev/null 2>&1 || true
 }
+
+# Last read-only preflight, while the machine is still online and still has a
+# way to fix itself.
+check_network_transition
 
 # Everything below mutates the system, so a non-zero exit from here on leaves a
 # half-upgraded machine that must not be rebooted.
