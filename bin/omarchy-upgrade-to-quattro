@@ -663,11 +663,26 @@ configure_lock_authentication() {
 }
 
 create_pre_upgrade_snapshot() {
-  # 127 means Snapper is deliberately absent. Any other failure already said
-  # what went wrong, and a missing snapshot is not worth blocking the upgrade
-  # over, but it must not pass for one either.
-  omarchy-snapshot create || (($? == 127)) ||
-    echo -e "\e[33mContinuing the upgrade without a snapshot.\e[0m" >&2
+  # omarchy-snapshot exits 127 when Snapper is missing, so decide that here
+  # instead of swallowing the exit code. The machines without Snapper are the
+  # hand-rolled ones with no other rollback, and this upgrade is one-way, so
+  # saying nothing would send them in believing they had a snapshot.
+  if ! command -v snapper >/dev/null 2>&1; then
+    warn "Snapper is not installed, so NO pre-upgrade snapshot will be taken; if this upgrade fails, there is no automatic rollback."
+    echo "Install snapper and re-run, or take your own backup first (on btrfs, a manual read-only snapshot of the root subvolume)." >&2
+
+    if (( ! yes )); then
+      # Declining is a clean abort: nothing on disk has changed yet, and
+      # exiting 0 keeps cleanup_on_exit from reporting a half-upgraded system.
+      gum confirm "Continue without a pre-upgrade snapshot?" </dev/tty || exit 0
+    fi
+
+    return 0
+  fi
+
+  # Any other failure already said what went wrong, and a missing snapshot is
+  # not worth blocking the upgrade over, but it must not pass for one either.
+  omarchy-snapshot create || warn "Continuing the upgrade without a snapshot."
 }
 
 remove_conflicting_legacy_packages() {
